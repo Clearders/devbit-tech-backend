@@ -2,7 +2,7 @@ use axum::{response::Html, routing::get, Router};
 use sqlx::{Pool, Postgres};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool = Pool::<Postgres>::connect("postgres://postgres:@localhost:5432/postgres").await?;
+    let pool = Pool::<Postgres>::connect("postgres://hunter:yangandmi@localhost:5432/postgres").await?;
 
     sqlx::query("CREATE DATABASE IF NOT EXISTS users")
         .execute(&pool)
