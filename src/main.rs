@@ -45,6 +45,7 @@ async fn create_user(
     //         id: 0,
     //     })
     // }
+    println!("接收到前端json，开始将用户数据插入数据库");
     let row = sqlx::query("INSERT INTO users (name, email,password) VALUES ($1, $2, $3) RETURNING id")
         .bind(&payload.name)
         .bind(&payload.email)
