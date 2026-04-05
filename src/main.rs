@@ -7,6 +7,7 @@ use sqlx::{Pool, Postgres, Row};
 use rand;
 use resend_rs::types::{CreateEmailBaseOptions, Tag};
 use resend_rs::{Resend, Result};
+use tower_http::cors::{CorsLayer};
 mod database;
 #[derive(Deserialize)]
 struct CreateUserRequest {
@@ -90,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", post(create_user))
         .route("/register/send_code",post(send_verification_code))
+        .layer(CorsLayer::permissive())
         .with_state(pool);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?;
     axum::serve(listener, app).await?;
