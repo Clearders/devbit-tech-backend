@@ -88,7 +88,7 @@ async fn send_verification_code(pool:State<Pool<Postgres>>,email:String) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = database::db_init().await?;
     let app = Router::new()
-        .route("/register", post(create_user))
+        .route("/", post(create_user))
         .route("/register/send_code",post(send_verification_code))
         .with_state(pool);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?;
