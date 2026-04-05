@@ -20,9 +20,8 @@ struct User {
 struct CreateUserRequest {
     name: String,
     email: String,
-    emailCode: String,
+    code: String,
     password: String,
-    confirm_password: String,
 }
 #[derive(Serialize)]
 struct CreateUserResponse {
@@ -46,7 +45,7 @@ async fn create_user(
 ) -> Json<CreateUserResponse> {
     let temp:String = sqlx::query("SELECT code FROM verify_code WHERE email = $1")
         .bind(&payload.email).fetch_one(&*pool).await.unwrap().get(0);
-    if temp != payload.emailCode || payload.confirm_password != payload.password{
+    if temp != payload.code{
         return Json(CreateUserResponse {
             name: payload.name.clone(),
             email: payload.email.clone(),
