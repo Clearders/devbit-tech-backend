@@ -20,13 +20,12 @@ struct User {
 struct CreateUserRequest {
     name: String,
     email: String,
-    code: String,
+    emailCode: String,
     password: String,
     confirm_password: String,
 }
 #[derive(Serialize)]
 struct CreateUserResponse {
-    status_code: u16,
     name: String,
     email: String,
     id:i32,
@@ -47,9 +46,8 @@ async fn create_user(
 ) -> Json<CreateUserResponse> {
     let temp:String = sqlx::query("SELECT code FROM verify_code WHERE email = $1")
         .bind(&payload.email).fetch_one(&*pool).await.unwrap().get(0);
-    if temp != payload.code || payload.confirm_password != payload.password{
+    if temp != payload.emailCode || payload.confirm_password != payload.password{
         return Json(CreateUserResponse {
-            status_code: 401,
             name: payload.name.clone(),
             email: payload.email.clone(),
             id: 0,
@@ -64,7 +62,6 @@ async fn create_user(
         .await;
     println!("成功!");
     Json(CreateUserResponse {
-        status_code: 200,
         name: payload.name.clone(),
         email: payload.email.clone(),
         id: row.unwrap().get(0),
