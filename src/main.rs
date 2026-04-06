@@ -90,10 +90,11 @@ async fn login_check(pool: State<Pool<Postgres>>,payload:Json<LoginRequest>) -> 
         Err(StatusCode::UNAUTHORIZED)
     }
 }
-async fn send_verification_code(pool:State<Pool<Postgres>>,email:String) {
+async fn send_verification_code(pool:State<Pool<Postgres>>,email:Json<String>) {
+    println!("接收到前端json，开始发送验证码");
     let code = rand::random_range(100000..=999999);
     sqlx::query("INSERT INTO verify_code (email, code) VALUES ($1, $2)")
-        .bind(&email)
+        .bind(&*email)
         .bind(&code)
         .execute(&*pool)
         .await
