@@ -97,12 +97,12 @@ async fn login_check(pool: State<Pool<Postgres>>,payload:Json<LoginRequest>) -> 
 async fn send_verification_code(pool:State<Pool<Postgres>>,req:Json<SendCodeRequest>) {
     println!("接收到前端json，开始发送验证码");
     let code = rand::random_range(100000..=999999);
-    sqlx::query("INSERT INTO verify_code (email, code) VALUES ($1, $2)")
-        .bind(&req.email)
-        .bind(&code)
-        .execute(&*pool)
-        .await
-        .unwrap();
+    // sqlx::query("INSERT INTO verify_code (email, code) VALUES ($1, $2)")
+    //     .bind(&req.email)
+    //     .bind(&code)
+    //     .execute(&*pool)
+    //     .await
+    //     .unwrap();
     let email = Message::builder()
         .from(Mailbox::new(Some("devbit".to_owned()), "2043399410@qq.com".parse().unwrap()))
         .to(Mailbox::new(Some("client".to_owned()), req.email.parse().unwrap()))
