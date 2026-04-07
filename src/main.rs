@@ -142,9 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-    sub: i32,      // 用户ID
+    sub: i32,
     email: String,
-    exp: usize,    // 过期时间戳
+    exp: usize,
 }
 
 fn generate_token(user_id: i32, email: &str) -> String {
