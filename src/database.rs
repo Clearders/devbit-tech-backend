@@ -24,7 +24,7 @@ pub async fn db_init() -> Result<Pool<Postgres>, sqlx::Error> {
         Err(_) => println!("密码列已存在."),
 
     }
-    match sqlx::query("CREATE TABLE verify_code (email TEXT NOT NULL, code VARCHAR(6) NOT NULL")
+    match sqlx::query("CREATE TABLE verify_code (email TEXT NOT NULL, code VARCHAR(6) NOT NULL)")
         .execute(&pool)
         .await
     {
