@@ -10,6 +10,8 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
+use std::env;
+use dotenv::dotenv;
 mod database;
 #[derive(Serialize)]
 struct User {
@@ -126,6 +128,7 @@ async fn send_verification_code(pool:State<Pool<Postgres>>,req:Json<SendCodeRequ
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
     let pool = database::db_init().await?;
     let app = Router::new()
         .route("/register", post(create_user))
@@ -157,7 +160,7 @@ fn generate_token(user_id: i32, email: &str) -> String {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret("your_secret_key".as_ref()),
+        &EncodingKey::from_secret(env::var("JWT_SECRET").expect("JWT_SECRET must be set").as_bytes()),
     )
         .unwrap()
 }
