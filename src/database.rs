@@ -15,15 +15,18 @@ pub async fn db_init() -> Result<Pool<Postgres>, sqlx::Error> {
         PgPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(5))
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '10s'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(&database_url),
     )
     .await
     .map_err(|_| sqlx::Error::PoolTimedOut)??;
-
-    // Set a reasonable statement timeout to catch slow queries early
-    sqlx::query("SET statement_timeout = '10000'")
-        .execute(&pool)
-        .await?;
 
     info!("Database connected, pool ready");
 

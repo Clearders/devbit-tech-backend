@@ -1,9 +1,8 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, put},
-    Extension,
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{DecodingKey, Validation, decode};
@@ -168,10 +167,10 @@ fn avatar_for_user(id: i32, name: &str) -> String {
 
     if initials.is_empty() {
         initials = name.chars().take(2).collect::<String>().to_uppercase();
-    } else if initials.len() == 1 {
-        if let Some(next) = name.chars().find(|ch| ch.is_ascii_lowercase()) {
-            initials.push(next.to_ascii_uppercase());
-        }
+    } else if initials.len() == 1
+        && let Some(next) = name.chars().find(|ch| ch.is_ascii_lowercase())
+    {
+        initials.push(next.to_ascii_uppercase());
     }
 
     initials
@@ -333,8 +332,16 @@ fn row_to_message(row: &PgRow) -> ForumMessage {
 
     ForumMessage {
         id: row.get("id"),
-        sender: forum_user(sender_id, row.get("sender_name"), row.get("sender_avatar_url")),
-        recipient: forum_user(recipient_id, row.get("recipient_name"), row.get("recipient_avatar_url")),
+        sender: forum_user(
+            sender_id,
+            row.get("sender_name"),
+            row.get("sender_avatar_url"),
+        ),
+        recipient: forum_user(
+            recipient_id,
+            row.get("recipient_name"),
+            row.get("recipient_avatar_url"),
+        ),
         content: row.get("content"),
         created_at: row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
         is_read: row.get("is_read"),
@@ -347,7 +354,11 @@ fn row_to_comment(row: &PgRow) -> ForumComment {
     ForumComment {
         id: row.get("id"),
         post_id: row.get("post_id"),
-        author: forum_user(author_id, row.get("author_name"), row.get("author_avatar_url")),
+        author: forum_user(
+            author_id,
+            row.get("author_name"),
+            row.get("author_avatar_url"),
+        ),
         content: row.get("content"),
         created_at: row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
     }
@@ -600,21 +611,25 @@ async fn my_posts(
     Ok(Json(rows.iter().map(row_to_post).collect()))
 }
 
-async fn modify_post(State(pool):State<Pool<Postgres>>
-,Path(id):Path<i32>
-,headers: HeaderMap
-,Json(payload): Json<ForumPost>)->Result<StatusCode,StatusCode>{
+async fn modify_post(
+    State(pool): State<Pool<Postgres>>,
+    Path(id): Path<i32>,
+    headers: HeaderMap,
+    Json(payload): Json<ForumPost>,
+) -> Result<StatusCode, StatusCode> {
     let user = require_current_user(&pool, &headers).await?;
     require_post_moderator(&pool, id, &user).await?;
 
-    let result = sqlx::query("UPDATE forum_posts 
+    let result = sqlx::query(
+        "UPDATE forum_posts
 SET content = $1,updated_at = NOW() 
-WHERE id = $2;")
-        .bind(payload.content)
-        .bind(id)
-        .execute(&pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+WHERE id = $2;",
+    )
+    .bind(payload.content)
+    .bind(id)
+    .execute(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if result.rows_affected() == 0 {
         Err(StatusCode::NOT_FOUND)
@@ -866,11 +881,7 @@ async fn send_message(
     };
 
     // Push WebSocket notification to recipient
-    let content_preview = if payload.content.len() > 60 {
-        format!("{}...", &payload.content[..57])
-    } else {
-        payload.content.clone()
-    };
+    let content_preview = message_preview(&payload.content);
     let ws_msg = serde_json::json!({
         "type": "new_message",
         "message_id": message.id,
@@ -881,6 +892,17 @@ async fn send_message(
     ws_state.send_to_user(payload.recipient_id, &ws_msg.to_string());
 
     Ok(Json(message))
+}
+
+fn message_preview(content: &str) -> String {
+    let mut chars = content.chars();
+    let first_sixty: String = chars.by_ref().take(60).collect();
+
+    if chars.next().is_none() {
+        first_sixty
+    } else {
+        format!("{}...", first_sixty.chars().take(57).collect::<String>())
+    }
 }
 
 async fn mark_message_read(
@@ -1114,5 +1136,35 @@ pub fn forum_routes() -> Router<Pool<Postgres>> {
         .route("/api/forum/friends/{friend_id}", delete(remove_friend))
         .route("/api/forum/users/search", get(search_users))
         .route("/api/forum/posts/myposts", get(my_posts))
-        .route("/api/forum/posts/myposts/modify_post/{id}", put(modify_post))
+        .route(
+            "/api/forum/posts/myposts/modify_post/{id}",
+            put(modify_post),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_preview;
+
+    #[test]
+    fn message_preview_preserves_up_to_sixty_characters() {
+        for value in [
+            "a".repeat(60),
+            '\u{754c}'.to_string().repeat(60),
+            '\u{1f600}'.to_string().repeat(60),
+        ] {
+            assert_eq!(message_preview(&value), value);
+        }
+    }
+
+    #[test]
+    fn message_preview_truncates_by_unicode_characters() {
+        for character in ['a', '\u{754c}', '\u{1f600}'] {
+            let value = character.to_string().repeat(61);
+            assert_eq!(
+                message_preview(&value),
+                format!("{}...", character.to_string().repeat(57))
+            );
+        }
+    }
 }

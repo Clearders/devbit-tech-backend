@@ -1,8 +1,6 @@
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
+    Extension,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
 use dashmap::DashMap;
@@ -13,17 +11,21 @@ use sqlx::Postgres;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ── WebSocket shared state ──────────────────────────────────────────────────
 
 /// Per-connection sender handle.
-type Tx = mpsc::UnboundedSender<Message>;
+type Tx = mpsc::Sender<Message>;
+
+const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 64 * 1024;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct WsState {
     /// user_id → list of sender handles (supports multiple tabs/devices)
-    pub connections: Arc<DashMap<i32, Vec<(Tx, Instant)>>>,
+    connections: Arc<DashMap<i32, Vec<Tx>>>,
     pub pool: Pool<Postgres>,
 }
 
@@ -39,7 +41,7 @@ impl WsState {
     pub fn send_to_user(&self, user_id: i32, json: &str) {
         if let Some(ref mut senders) = self.connections.get_mut(&user_id) {
             let text = json.to_string();
-            senders.retain(|(tx, _)| tx.send(Message::Text(text.clone().into())).is_ok());
+            senders.retain(|tx| enqueue(tx, Message::Text(text.clone().into())));
         }
     }
 
@@ -49,8 +51,19 @@ impl WsState {
         let text = json.to_string();
         for mut entry in self.connections.iter_mut() {
             let senders = entry.value_mut();
-            senders.retain(|(tx, _)| tx.send(Message::Text(text.clone().into())).is_ok());
+            senders.retain(|tx| enqueue(tx, Message::Text(text.clone().into())));
         }
+    }
+}
+
+fn enqueue(tx: &Tx, message: Message) -> bool {
+    match tx.try_send(message) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("dropping WebSocket message because the outbound queue is full");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
@@ -69,6 +82,26 @@ enum ClientMessage {
     Unsubscribe { channel: String },
 }
 
+fn parse_application_message(
+    text: &str,
+    authenticated: bool,
+) -> Result<ClientMessage, &'static str> {
+    let message = serde_json::from_str::<ClientMessage>(text).map_err(|_| {
+        if authenticated {
+            "Invalid message"
+        } else {
+            "Authentication must be the first message"
+        }
+    })?;
+
+    match (&message, authenticated) {
+        (ClientMessage::Auth { .. }, true) => Err("Already authenticated"),
+        (ClientMessage::Auth { .. }, false) => Ok(message),
+        (_, false) => Err("Authentication must be the first message"),
+        (_, true) => Ok(message),
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
@@ -78,26 +111,16 @@ enum ServerMessage {
     AuthOk { user_id: i32 },
     /// Authentication failed
     AuthError { reason: String },
-    /// New private message notification
-    NewMessage {
-        message_id: i32,
-        sender_id: i32,
-        sender_name: String,
-        content_preview: String,
-    },
     /// User came online
     UserOnline { user_id: i32 },
     /// User went offline
     UserOffline { user_id: i32 },
-    /// Generic notification
-    Notification { title: String, body: String },
 }
 
 // ── JWT validation for WebSocket ────────────────────────────────────────────
 
 fn user_id_from_token(token: &str) -> Option<i32> {
-    let secret =
-        std::env::var("JWT_SECRET").unwrap_or_else(|_| "devbit-local-secret".to_string());
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "devbit-local-secret".to_string());
     #[derive(serde::Deserialize)]
     struct Claims {
         sub: i32,
@@ -111,15 +134,6 @@ fn user_id_from_token(token: &str) -> Option<i32> {
     Some(data.claims.sub)
 }
 
-fn token_from_cookie(cookie_str: &str) -> Option<String> {
-    cookie_str.split(';').find_map(|cookie| {
-        cookie
-            .trim()
-            .strip_prefix("auth_token=")
-            .map(str::to_string)
-    })
-}
-
 // ── WebSocket handler ───────────────────────────────────────────────────────
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -127,17 +141,19 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(ws_state): State<WsState>,
+    Extension(ws_state): Extension<WsState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, ws_state))
+    ws.max_frame_size(MAX_WEBSOCKET_MESSAGE_SIZE)
+        .max_message_size(MAX_WEBSOCKET_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, ws_state))
 }
 
 async fn handle_socket(socket: WebSocket, ws_state: WsState) {
     let (mut sender_tx, mut receiver_rx) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
 
     // Forward messages from the channel to the WebSocket sender
-    let forward_task = tokio::spawn(async move {
+    let mut forward_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender_tx.send(msg).await.is_err() {
                 break;
@@ -148,19 +164,27 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
     let mut user_id: Option<i32> = None;
     let mut last_heartbeat = Instant::now();
     let mut authenticated = false;
+    let auth_deadline = tokio::time::sleep(AUTH_TIMEOUT);
+    tokio::pin!(auth_deadline);
 
     // Heartbeat ticker
-    let mut heartbeat_timer =
-        tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_timer = tokio::time::interval(HEARTBEAT_INTERVAL);
 
     loop {
         tokio::select! {
+            _ = &mut auth_deadline, if !authenticated => {
+                let error = serde_json::to_string(&ServerMessage::AuthError {
+                    reason: "Authentication timed out".into(),
+                }).unwrap_or_default();
+                enqueue(&tx, Message::Text(error.into()));
+                break;
+            }
             // Incoming messages from client
             msg = receiver_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                            match client_msg {
+                        match parse_application_message(&text, authenticated) {
+                            Ok(client_msg) => match client_msg {
                                 ClientMessage::Auth { token } => {
                                     match user_id_from_token(&token) {
                                         Some(uid) => {
@@ -172,7 +196,7 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                                             ws_state.connections
                                                 .entry(uid)
                                                 .or_default()
-                                                .push((tx.clone(), Instant::now()));
+                                                .push(tx.clone());
 
                                             // Broadcast online status
                                             let online_msg = serde_json::to_string(
@@ -181,14 +205,14 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                                             ws_state.broadcast(&online_msg);
 
                                             // Send auth confirmation
-                                            let _ = tx.send(Message::Text(
+                                            enqueue(&tx, Message::Text(
                                                 serde_json::to_string(
                                                     &ServerMessage::AuthOk { user_id: uid }
                                                 ).unwrap_or_default().into()
                                             ));
                                         }
                                         None => {
-                                            let _ = tx.send(Message::Text(
+                                            enqueue(&tx, Message::Text(
                                                 serde_json::to_string(
                                                     &ServerMessage::AuthError {
                                                         reason: "Invalid token".into()
@@ -201,7 +225,7 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                                 }
                                 ClientMessage::Ping => {
                                     last_heartbeat = Instant::now();
-                                    let _ = tx.send(Message::Text(
+                                    enqueue(&tx, Message::Text(
                                         serde_json::to_string(&ServerMessage::Pong)
                                             .unwrap_or_default()
                                             .into()
@@ -210,13 +234,20 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                                 ClientMessage::Subscribe { channel } => {
                                     debug!(?channel, user_id, "WebSocket subscribe");
                                     // Channel subscriptions can be extended later
-                                    let _ = tx.send(Message::Text(
+                                    enqueue(&tx, Message::Text(
                                         format!(r#"{{"type":"subscribed","channel":"{}"}}"#, channel).into()
                                     ));
                                 }
                                 ClientMessage::Unsubscribe { channel } => {
                                     debug!(?channel, user_id, "WebSocket unsubscribe");
                                 }
+                            },
+                            Err(reason) => {
+                                let error = serde_json::to_string(&ServerMessage::AuthError {
+                                    reason: reason.into(),
+                                }).unwrap_or_default();
+                                enqueue(&tx, Message::Text(error.into()));
+                                break;
                             }
                         }
                     }
@@ -224,14 +255,20 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = tx.send(Message::Pong(data));
+                        enqueue(&tx, Message::Pong(data));
                         last_heartbeat = Instant::now();
                     }
                     Some(Ok(Message::Pong(_))) => {
                         last_heartbeat = Instant::now();
                     }
                     Some(Ok(Message::Binary(_))) => {
-                        // Binary messages not used in current protocol
+                        if !authenticated {
+                            let error = serde_json::to_string(&ServerMessage::AuthError {
+                                reason: "Authentication must be the first message".into(),
+                            }).unwrap_or_default();
+                            enqueue(&tx, Message::Text(error.into()));
+                            break;
+                        }
                     }
                     Some(Err(e)) => {
                         warn!("WebSocket error: {}", e);
@@ -248,7 +285,7 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
                     break;
                 }
                 // Send server ping
-                let _ = tx.send(Message::Ping(vec![]));
+                enqueue(&tx, Message::Ping(Vec::new().into()));
             }
         }
     }
@@ -256,27 +293,67 @@ async fn handle_socket(socket: WebSocket, ws_state: WsState) {
     // ── Cleanup on disconnect ────────────────────────────────────────────
     if let Some(uid) = user_id {
         // Remove this connection
-        let mut removed = false;
         if let Some(mut senders) = ws_state.connections.get_mut(&uid) {
-            senders.retain(|(t, _)| !t.same_channel(&tx));
-            if senders.is_empty() {
-                removed = true;
-            }
+            senders.retain(|sender| !sender.same_channel(&tx));
         }
-        if removed {
-            ws_state.connections.remove(&uid);
-        }
+        let removed = ws_state
+            .connections
+            .remove_if(&uid, |_, senders| senders.is_empty())
+            .is_some();
 
         // Broadcast offline if no other connections remain
-        if !ws_state.connections.contains_key(&uid) {
-            let offline_msg = serde_json::to_string(
-                &ServerMessage::UserOffline { user_id: uid }
-            ).unwrap_or_default();
+        if removed {
+            let offline_msg = serde_json::to_string(&ServerMessage::UserOffline { user_id: uid })
+                .unwrap_or_default();
             ws_state.broadcast(&offline_msg);
             info!(user_id = uid, "User offline (all connections closed)");
         }
     }
 
-    // Clean up forward task
-    forward_task.abort();
+    // Let queued protocol responses flush, but never let a stalled peer retain the task.
+    drop(tx);
+    if tokio::time::timeout(Duration::from_secs(1), &mut forward_task)
+        .await
+        .is_err()
+    {
+        warn!("timed out flushing the WebSocket outbound queue");
+        forward_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_must_be_first_application_message() {
+        assert!(matches!(
+            parse_application_message(r#"{"type":"auth","token":"token"}"#, false),
+            Ok(ClientMessage::Auth { .. })
+        ));
+        assert_eq!(
+            parse_application_message(r#"{"type":"ping"}"#, false).unwrap_err(),
+            "Authentication must be the first message"
+        );
+        assert_eq!(
+            parse_application_message(r#"{"type":"auth","token":"token"}"#, true).unwrap_err(),
+            "Already authenticated"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_queue_drops_message_without_discarding_sender() {
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(enqueue(&tx, Message::Text("first".into())));
+        assert!(enqueue(&tx, Message::Text("dropped".into())));
+        assert!(matches!(rx.recv().await, Some(Message::Text(text)) if text == "first"));
+        assert!(enqueue(&tx, Message::Text("next".into())));
+    }
+
+    #[test]
+    fn closed_queue_discards_sender() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(!enqueue(&tx, Message::Text("message".into())));
+    }
 }

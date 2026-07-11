@@ -1,11 +1,11 @@
+use axum::Extension;
 use axum::extract::State;
+use axum::extract::{ConnectInfo, Multipart, Path as AxumPath};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::extract::{ConnectInfo, Multipart, Path as AxumPath};
-use axum::middleware;
-use axum::Extension;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
 use dotenv::dotenv;
@@ -14,18 +14,18 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
-use rand;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::{Pool, Postgres, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn, error, info_span, Instrument};
+use tokio::sync::Mutex;
+use tracing::{Instrument, error, info, info_span, warn};
 use uuid::Uuid;
 
 mod database;
@@ -157,13 +157,14 @@ async fn login_check(
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, StatusCode> {
     let email = payload.email.trim().to_lowercase();
-    let row =
-        sqlx::query("SELECT password, id, name, email, avatar_url FROM users WHERE LOWER(email) = LOWER($1)")
-            .bind(&email)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+    let row = sqlx::query(
+        "SELECT password, id, name, email, avatar_url FROM users WHERE LOWER(email) = LOWER($1)",
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
 
     let stored_password: String = row.get(0);
     if !verify_password(&payload.password, &stored_password) {
@@ -187,8 +188,9 @@ async fn login_check(
 
     let token =
         generate_token(user_id, &user_email).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let cookie =
-        format!("{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400");
+    let cookie = format!(
+        "{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400"
+    );
 
     Ok((
         [(header::SET_COOKIE, cookie)],
@@ -337,11 +339,7 @@ async fn upload_avatar(
         }
 
         // Validate file extension
-        let ext = file_name
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
+        let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
         if !ALLOWED_AVATAR_EXTS.contains(&ext.as_str()) {
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
@@ -364,20 +362,19 @@ async fn upload_avatar(
         }
 
         // Delete old avatar file if exists
-        let old_avatar: Option<String> = sqlx::query_scalar(
-            "SELECT avatar_url FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .flatten();
+        let old_avatar: Option<String> =
+            sqlx::query_scalar("SELECT avatar_url FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .flatten();
 
-        if let Some(old_url) = old_avatar {
-            if let Some(old_filename) = old_url.strip_prefix("/api/avatars/") {
-                let old_path = format!("{}/{}", AVATAR_DIR, old_filename);
-                let _ = fs::remove_file(&old_path).await;
-            }
+        if let Some(old_url) = old_avatar
+            && let Some(old_filename) = old_url.strip_prefix("/api/avatars/")
+        {
+            let old_path = format!("{}/{}", AVATAR_DIR, old_filename);
+            let _ = fs::remove_file(&old_path).await;
         }
 
         // Write new file
@@ -421,9 +418,7 @@ async fn upload_avatar(
     }))
 }
 
-async fn serve_avatar(
-    AxumPath(filename): AxumPath<String>,
-) -> Result<Response, StatusCode> {
+async fn serve_avatar(AxumPath(filename): AxumPath<String>) -> Result<Response, StatusCode> {
     // Prevent directory traversal
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return Err(StatusCode::NOT_FOUND);
@@ -435,14 +430,9 @@ async fn serve_avatar(
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let mime = mime_guess::from_path(&filename)
-        .first_or_octet_stream();
+    let mime = mime_guess::from_path(&filename).first_or_octet_stream();
 
-    Ok((
-        [(header::CONTENT_TYPE, mime.as_ref())],
-        data,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, mime.as_ref())], data).into_response())
 }
 
 async fn logout() -> Response {
@@ -459,78 +449,94 @@ async fn logout() -> Response {
 
 // ── Rate Limiter ────────────────────────────────────────────────────────────
 
-type RateLimiter = Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>;
+#[derive(Clone)]
+struct RateLimiter {
+    requests: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    last_sweep: Arc<Mutex<Instant>>,
+    max_requests: usize,
+    window: StdDuration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: usize, window: StdDuration) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            last_sweep: Arc::new(Mutex::new(Instant::now())),
+            max_requests,
+            window,
+        }
+    }
+
+    async fn check_at(&self, addr: IpAddr, now: Instant) -> Result<(), StdDuration> {
+        let should_sweep = {
+            let mut last_sweep = self.last_sweep.lock().await;
+            if now.saturating_duration_since(*last_sweep) >= self.window {
+                *last_sweep = now;
+                true
+            } else {
+                false
+            }
+        };
+
+        let mut requests = self.requests.lock().await;
+        if should_sweep {
+            requests.retain(|_, entries| {
+                entries.retain(|timestamp| now.saturating_duration_since(*timestamp) < self.window);
+                !entries.is_empty()
+            });
+        }
+
+        let entries = requests.entry(addr).or_default();
+        while entries
+            .front()
+            .is_some_and(|timestamp| now.saturating_duration_since(*timestamp) >= self.window)
+        {
+            entries.pop_front();
+        }
+
+        if entries.len() >= self.max_requests {
+            let retry_after = self
+                .window
+                .saturating_sub(now.saturating_duration_since(entries[0]));
+            return Err(retry_after);
+        }
+
+        entries.push_back(now);
+        Ok(())
+    }
+}
 
 #[derive(Serialize)]
 struct RateLimitError {
     error: String,
 }
 
-/// Simple sliding-window rate limiting middleware (10 req / 60s per IP).
-async fn rate_limit_middleware(
-    State(limiter): State<RateLimiter>,
-    ConnectInfo(addr): ConnectInfo<IpAddr>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    const MAX_REQUESTS: usize = 10;
-    const WINDOW_SECS: u64 = 60;
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(WINDOW_SECS);
-
-    {
-        let mut map = limiter.lock().unwrap();
-        let entries = map.entry(addr).or_default();
-        entries.retain(|t| now.duration_since(*t) < window);
-
-        if entries.len() >= MAX_REQUESTS {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, "60")],
-                Json(RateLimitError {
-                    error: "Too many requests. Try again later.".into(),
-                }),
-            )
-                .into_response();
-        }
-
-        entries.push(now);
-    }
-
-    next.run(request).await
+fn retry_after_seconds(duration: StdDuration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .max(1)
 }
 
-/// Stricter rate limiter for auth-sensitive endpoints (5 req / 60s per IP).
-async fn strict_rate_limit_middleware(
+/// Configurable sliding-window rate limiting middleware.
+async fn rate_limit_middleware(
     State(limiter): State<RateLimiter>,
-    ConnectInfo(addr): ConnectInfo<IpAddr>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    const MAX_REQUESTS: usize = 5;
-    const WINDOW_SECS: u64 = 60;
-
-    let now = Instant::now();
-    let window = std::time::Duration::from_secs(WINDOW_SECS);
-
-    {
-        let mut map = limiter.lock().unwrap();
-        let entries = map.entry(addr).or_default();
-        entries.retain(|t| now.duration_since(*t) < window);
-
-        if entries.len() >= MAX_REQUESTS {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, "60")],
-                Json(RateLimitError {
-                    error: "Too many requests. Try again later.".into(),
-                }),
-            )
-                .into_response();
-        }
-
-        entries.push(now);
+    if let Err(retry_after) = limiter.check_at(addr.ip(), Instant::now()).await {
+        // Retry-After is expressed in whole seconds and must never tell a blocked
+        // client to retry immediately.
+        let retry_after_secs = retry_after_seconds(retry_after);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(RateLimitError {
+                error: "Too many requests. Try again later.".into(),
+            }),
+        )
+            .into_response();
     }
 
     next.run(request).await
@@ -547,12 +553,9 @@ struct HealthResponse {
 
 async fn health_check(
     State(pool): State<Pool<Postgres>>,
-    State(start_time): State<Arc<Instant>>,
+    Extension(start_time): Extension<Arc<Instant>>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
-    let db_ok = sqlx::query("SELECT 1")
-        .fetch_one(&pool)
-        .await
-        .is_ok();
+    let db_ok = sqlx::query("SELECT 1").fetch_one(&pool).await.is_ok();
 
     Ok(Json(HealthResponse {
         status: if db_ok { "ok" } else { "degraded" },
@@ -627,14 +630,8 @@ async fn security_headers_middleware(
 ) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        "nosniff".parse().unwrap(),
-    );
-    headers.insert(
-        header::X_FRAME_OPTIONS,
-        "DENY".parse().unwrap(),
-    );
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     headers.insert(
         header::STRICT_TRANSPORT_SECURITY,
         "max-age=63072000; includeSubDomains; preload"
@@ -683,7 +680,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Database connection pool initialized");
 
     // ── Rate limiter state ──────────────────────────────────────────────────
-    let rate_limiter: RateLimiter = Arc::new(Mutex::new(HashMap::new()));
+    let strict_rate_limiter = RateLimiter::new(5, StdDuration::from_secs(60));
+    let general_rate_limiter = RateLimiter::new(10, StdDuration::from_secs(60));
     let start_time = Arc::new(Instant::now());
 
     // ── WebSocket state ─────────────────────────────────────────────────────
@@ -698,10 +696,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/register", post(create_user))
         .route("/api/login", post(login_check))
         .route_layer(middleware::from_fn_with_state(
-            rate_limiter.clone(),
-            strict_rate_limit_middleware,
-        ))
-        .with_state(pool.clone());
+            strict_rate_limiter,
+            rate_limit_middleware,
+        ));
 
     // General routes — standard rate limit (10 req / 60s)
     let general_routes = Router::new()
@@ -715,32 +712,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/logout", post(logout))
         .merge(forum::forum_routes())
         .route_layer(middleware::from_fn_with_state(
-            rate_limiter,
+            general_rate_limiter,
             rate_limit_middleware,
-        ))
-        .layer(Extension(ws_state.clone()))
-        .with_state(pool.clone());
+        ));
 
     // Health + WebSocket routes — no rate limiting
     let infra_routes = Router::new()
         .route("/health", get(health_check))
         .route("/api/health", get(health_check))
         .route("/ws", get(ws::ws_handler))
-        .route("/api/ws", get(ws::ws_handler))
-        .with_state(ws_state)
-        .with_state(pool.clone())
-        .with_state(start_time);
+        .route("/api/ws", get(ws::ws_handler));
 
     let app = auth_routes
         .merge(general_routes)
         .merge(infra_routes)
         .layer(middleware::from_fn(logging_middleware))
-        .layer(middleware::from_fn(security_headers_middleware));
+        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(Extension(start_time))
+        .layer(Extension(ws_state))
+        .with_state(pool);
 
     info!("Listening on 127.0.0.1:7878");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7878").await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rate_limiter_tests {
+    use super::*;
+
+    const IP_ONE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    const IP_TWO: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+
+    #[tokio::test]
+    async fn strict_and_general_thresholds_are_independent() {
+        let strict = RateLimiter::new(5, StdDuration::from_secs(60));
+        let general = RateLimiter::new(10, StdDuration::from_secs(60));
+        let now = Instant::now();
+
+        for _ in 0..5 {
+            assert!(strict.check_at(IP_ONE, now).await.is_ok());
+        }
+        assert!(strict.check_at(IP_ONE, now).await.is_err());
+
+        for _ in 0..10 {
+            assert!(general.check_at(IP_ONE, now).await.is_ok());
+        }
+        assert!(general.check_at(IP_ONE, now).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn requests_are_counted_separately_per_ip() {
+        let limiter = RateLimiter::new(1, StdDuration::from_secs(60));
+        let now = Instant::now();
+
+        assert!(limiter.check_at(IP_ONE, now).await.is_ok());
+        assert!(limiter.check_at(IP_ONE, now).await.is_err());
+        assert!(limiter.check_at(IP_TWO, now).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_requests_leave_the_sliding_window() {
+        let window = StdDuration::from_secs(60);
+        let limiter = RateLimiter::new(1, window);
+        let now = Instant::now();
+
+        assert!(limiter.check_at(IP_ONE, now).await.is_ok());
+        assert!(limiter.check_at(IP_ONE, now + window).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn global_sweep_removes_stale_ip_entries() {
+        let window = StdDuration::from_secs(60);
+        let limiter = RateLimiter::new(1, window);
+        let now = Instant::now();
+        limiter.check_at(IP_ONE, now).await.unwrap();
+
+        limiter.check_at(IP_TWO, now + window).await.unwrap();
+
+        let requests = limiter.requests.lock().await;
+        assert!(!requests.contains_key(&IP_ONE));
+        assert!(requests.contains_key(&IP_TWO));
+    }
+
+    #[tokio::test]
+    async fn retry_after_tracks_oldest_request_and_rounds_up() {
+        let limiter = RateLimiter::new(1, StdDuration::from_secs(60));
+        let now = Instant::now();
+        limiter.check_at(IP_ONE, now).await.unwrap();
+
+        let remaining = limiter
+            .check_at(IP_ONE, now + StdDuration::from_millis(10_500))
+            .await
+            .unwrap_err();
+        assert_eq!(remaining, StdDuration::from_millis(49_500));
+        assert_eq!(retry_after_seconds(remaining), 50);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
