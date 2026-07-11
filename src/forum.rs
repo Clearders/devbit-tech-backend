@@ -574,30 +574,29 @@ async fn create_post(
 }
 
 async fn my_posts(
-    State(pool):State<Pool<Postgres>>,
+    State(pool): State<Pool<Postgres>>,
     headers: HeaderMap,
-)->Result<Json<Vec<ForumPost>>, StatusCode>{
+) -> Result<Json<Vec<ForumPost>>, StatusCode> {
     let user_id = require_user_id(&headers)?;
-    let rows =sqlx::query("SELECT p.id,
-            p.title,
-            p.content,
-            p.author_id,
-            p.category,
-            p.tags,
-            p.created_at,
-            p.updated_at,
-            p.view_count,
-            p.is_pinned,
-            p.is_locked,
-            u.name as author_name,
-            u.avatar_url as author_avatar_url
-     FROM forum_posts p
-     JOIN users u ON u.id = p.author_id
-     WHERE p.author_id = $1")
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = sqlx::query(
+        "SELECT p.id, p.title, p.content, p.author_id, p.category, p.tags,
+                p.created_at, p.updated_at, p.view_count::BIGINT as view_count,
+                p.is_pinned, p.is_locked, u.name as author_name,
+                u.avatar_url as author_avatar_url,
+                (SELECT COUNT(*) FROM forum_comments WHERE post_id = p.id)::BIGINT as comment_count,
+                COUNT(l.user_id)::BIGINT as like_count,
+                COALESCE(BOOL_OR(l.user_id = $1), false) as liked_by_me
+         FROM forum_posts p
+         JOIN users u ON u.id = p.author_id
+         LEFT JOIN forum_post_likes l ON l.post_id = p.id
+         WHERE u.id = $1
+         GROUP BY p.id, u.name, u.avatar_url
+         ORDER BY p.is_pinned DESC, p.created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(rows.iter().map(row_to_post).collect()))
 }
 
