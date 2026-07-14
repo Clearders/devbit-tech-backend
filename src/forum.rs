@@ -1,3 +1,4 @@
+use crate::auth;
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
@@ -5,19 +6,8 @@ use axum::{
     routing::{delete, get, put},
 };
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, Row, postgres::PgRow};
-use std::env;
-
-const AUTH_COOKIE_NAME: &str = "auth_token";
-
-#[derive(Debug, Clone, Deserialize)]
-struct Claims {
-    sub: i32,
-    #[serde(rename = "exp")]
-    _exp: usize,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +76,11 @@ pub struct CreatePostRequest {
     pub content: String,
     pub category: Option<String>,
     pub tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePostRequest {
+    pub content: String,
 }
 
 #[derive(Deserialize)]
@@ -182,47 +177,12 @@ fn forum_user(id: i32, name: String, avatar_url: Option<String>) -> ForumUser {
         avatar: avatar_for_user(id, &name),
         name,
         avatar_url,
-        is_admin: id == 1 || id == 2,
+        is_admin: auth::is_admin_user(id),
     }
-}
-
-fn token_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(token) = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(token.to_string());
-    }
-
-    headers
-        .get("cookie")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                cookie
-                    .trim()
-                    .strip_prefix(&format!("{AUTH_COOKIE_NAME}="))
-                    .map(str::to_string)
-            })
-        })
-}
-
-fn user_id_from_token(token: &str) -> Option<i32> {
-    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "devbit-local-secret".to_string());
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
-    )
-    .ok()?;
-    Some(data.claims.sub)
 }
 
 fn optional_user_id(headers: &HeaderMap) -> Option<i32> {
-    token_from_headers(headers).and_then(|token| user_id_from_token(&token))
+    auth::user_id_from_headers(headers)
 }
 
 fn require_user_id(headers: &HeaderMap) -> Result<i32, StatusCode> {
@@ -615,7 +575,7 @@ async fn modify_post(
     State(pool): State<Pool<Postgres>>,
     Path(id): Path<i32>,
     headers: HeaderMap,
-    Json(payload): Json<ForumPost>,
+    Json(payload): Json<UpdatePostRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let user = require_current_user(&pool, &headers).await?;
     require_post_moderator(&pool, id, &user).await?;
@@ -1144,7 +1104,7 @@ pub fn forum_routes() -> Router<Pool<Postgres>> {
 
 #[cfg(test)]
 mod tests {
-    use super::message_preview;
+    use super::{UpdatePostRequest, message_preview};
 
     #[test]
     fn message_preview_preserves_up_to_sixty_characters() {
@@ -1166,5 +1126,15 @@ mod tests {
                 format!("{}...", character.to_string().repeat(57))
             );
         }
+    }
+
+    #[test]
+    fn update_post_request_only_requires_content() {
+        let payload: UpdatePostRequest = serde_json::from_str(
+            r#"{"content":"updated","id":7,"title":"ignored for compatibility"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(payload.content, "updated");
     }
 }

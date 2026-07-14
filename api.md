@@ -27,7 +27,7 @@
 - 用户认证通过 **JWT**（JSON Web Token）实现。
 - 客户端可通过以下两种方式传递令牌：
   1. **Authorization Header**: `Authorization: Bearer <token>`
-  2. **Cookie**: 登录时服务器通过 `Set-Cookie` 下发 `auth_token` cookie（`HttpOnly; SameSite=Lax; Max-Age=86400`）。
+  2. **Cookie**: 登录时服务器通过 `Set-Cookie` 下发 `auth_token` cookie（`HttpOnly; Secure; SameSite=Strict; Max-Age=86400`）。
 - 标注为"需认证"的接口必须提供有效 JWT。
 - 标注为"可选认证"的接口：未登录也可调用，但部分字段（如 `likedByMe`）会返回默认值。
 
@@ -63,6 +63,7 @@
 | 429        | 请求频率超限                     |
 | 500        | 服务器内部错误                   |
 | 502        | 上游服务错误（如 SMTP 发送失败）   |
+| 503        | 服务配置不可用（如生产环境未配置 SMTP） |
 
 ---
 
@@ -191,11 +192,12 @@
 }
 ```
 
-- `developmentCode`: 仅当未配置 SMTP 环境变量（`SMTP_USERNAME` 为空）时返回，方便开发测试。
+- `developmentCode`: 仅在明确的 `development`/`test` 环境（或未设置环境的 debug 构建）中返回；是否配置 SMTP 不影响此安全规则。
 - 验证码为 6 位数字，有效期 10 分钟。
 
 **错误响应**:
 - `400` — 邮箱格式无效
+- `503` — 当前环境不允许返回开发验证码且未配置 SMTP，无法发送验证码
 
 ---
 
@@ -226,7 +228,7 @@
 ```
 
 **错误响应**:
-- `400` — 必填字段为空
+- `400` — 必填字段为空，或密码超过 1,024 字节
 - `401` — 验证码无效或已过期
 - `409` — 邮箱已被注册
 
@@ -265,13 +267,14 @@
 
 **响应头**:
 ```
-Set-Cookie: auth_token=<jwt>; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400
+Set-Cookie: auth_token=<jwt>; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400
 ```
 
 - JWT 有效期 24 小时。
 - 若数据库中密码存储为旧版明文格式，登录成功时自动升级为 PBKDF2-SHA256 哈希。
 
 **错误响应**:
+- `400` — 密码为空或超过 1,024 字节
 - `401` — 邮箱不存在或密码错误
 
 ---
@@ -368,7 +371,7 @@ Set-Cookie: auth_token=<jwt>; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400
 
 **响应头**:
 ```
-Set-Cookie: auth_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+Set-Cookie: auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT
 ```
 
 ---
@@ -619,24 +622,11 @@ Set-Cookie: auth_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu,
 **请求体**:
 ```json
 {
-  "id": 1,
-  "title": "string",
-  "content": "修改后的内容",
-  "author": { ForumUser },
-  "category": "general",
-  "tags": ["rust"],
-  "createdAt": "...",
-  "updatedAt": "...",
-  "viewCount": 10,
-  "commentCount": 3,
-  "likeCount": 5,
-  "likedByMe": false,
-  "isPinned": false,
-  "isLocked": false
+  "content": "修改后的内容"
 }
 ```
 
-> 实际仅 `content` 字段会被更新，`updatedAt` 自动设为当前时间。其余字段在请求体中可传但不生效。
+仅 `content` 字段会被更新，`updatedAt` 自动设为当前时间。为兼容旧客户端，请求中的额外字段会被忽略。
 
 **成功响应** `200`（无响应体）
 
@@ -827,8 +817,10 @@ Set-Cookie: auth_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu,
 | 变量名          | 必需           | 说明                       | 默认值                                      |
 |-----------------|----------------|----------------------------|---------------------------------------------|
 | `DATABASE_URL`  | 否             | PostgreSQL 连接字符串        | `postgres://postgres:@localhost:5432/users` |
-| `JWT_SECRET`    | 否（生产必需）  | JWT 签名密钥                | `devbit-local-secret`                       |
-| `SMTP_USERNAME` | 否             | SMTP 发件邮箱地址            | —                                           |
+| `BIND_ADDR`     | 否             | 服务监听地址                 | `127.0.0.1:7878`                            |
+| `NODE_ENV`      | 否             | `development`、`test` 或 `production` | —                                  |
+| `JWT_SECRET`    | 生产/release 必需 | JWT 签名密钥；必须为非默认值 | `devbit-local-secret`（仅 debug 本地开发）   |
+| `SMTP_USERNAME` | 条件必需 | SMTP 发件邮箱地址；仅在明确的 `development`/`test`（或未设置环境的 debug 构建）中可省略 | — |
 | `SMTP_PASSWORD` | 条件必需        | SMTP 邮箱密码/授权码         | —                                           |
 | `SMTP_SERVER`   | 否             | SMTP 服务器地址              | `smtp.qq.com`                               |
 | `SMTP_PORT`     | 否             | SMTP 服务器端口              | `465`                                       |
@@ -837,6 +829,7 @@ Set-Cookie: auth_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu,
 
 - 密码使用 **PBKDF2-SHA256** 哈希存储。
 - 参数：100,000 次迭代，32 字节输出。
+- 输入限制：密码最多 1,024 字节，超限请求在哈希计算前拒绝。
 - 存储格式：`pbkdf2-sha256$<iterations>$<base64_salt>$<base64_hash>`。
 - 旧版明文密码在用户登录时自动升级为哈希格式。
 
